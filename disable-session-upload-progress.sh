@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# disable-session-upload-progress.sh v2.1 — PHP CVE azaltımı için php.ini sertleştirme betiği
+# disable-session-upload-progress.sh v2.2 — PHP CVE azaltımı için php.ini sertleştirme betiği
 #
 # Ne yapar?
 #   - Tüm global php.ini dosyalarında "session.upload_progress.enabled = Off" uygular.
@@ -25,11 +25,13 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]:-$0}")"
 BACKUP_SUFFIX="bak.session-upload-progress"
 POOL_BLOCK_BEGIN="; BEGIN php-cve-hardening"
 POOL_BLOCK_END="; END php-cve-hardening"
+INI_BLOCK_BEGIN="; BEGIN php-ini-hardening"
+INI_BLOCK_END="; END php-ini-hardening"
 
 MODE="dry-run"
 PROFILE="standard"
@@ -1227,7 +1229,6 @@ verify_php_cli_settings() {
         else
           _raw="$(printf '%s\n' "$output" | grep -m1 -Ei "^[[:space:]]*${key//./\\.}[[:space:]]*=>" || true)"
           print_fail "$bin (PHP $version): $key beklenen değeri vermedi ($expected bekleniyordu): ${_raw:-satır yok}"
-          printf '      php.ini: %s\n' "${loaded_ini:-belirlenemedi}"
         fi
         current_failed=1
       fi
@@ -1246,7 +1247,6 @@ verify_php_cli_settings() {
           else
             _raw="$(printf '%s\n' "$output" | grep -m1 -Ei "^[[:space:]]*${key//./\\.}[[:space:]]*=>" || true)"
             print_fail "$bin (PHP $version): $key hedeften gevşek ($expected veya daha katı bekleniyordu): ${_raw:-satır yok}"
-            printf '      php.ini: %s\n' "${loaded_ini:-belirlenemedi}"
           fi
           current_failed=1
         fi
@@ -1266,7 +1266,6 @@ verify_php_cli_settings() {
           else
             _raw="$(printf '%s\n' "$output" | grep -m1 -Ei "^[[:space:]]*${key//./\\.}[[:space:]]*=>" || true)"
             print_fail "$bin (PHP $version): $key hedeften gevşek ($expected veya daha katı bekleniyordu): ${_raw:-satır yok}"
-            printf '      php.ini: %s\n' "${loaded_ini:-belirlenemedi}"
           fi
           current_failed=1
         fi
@@ -1280,7 +1279,6 @@ verify_php_cli_settings() {
         current_failed=1
       elif [[ -n "$_miss" ]]; then
         print_fail "$bin (PHP $version): disable_functions içinde eksik: $(printf '%s' "$_miss" | tr '\n' ',' | sed 's/,$//')"
-        printf '      php.ini: %s\n' "${loaded_ini:-belirlenemedi}"
         current_failed=1
       else
         print_ok "$bin (PHP $version): disable_functions zorunlu listedeki tüm fonksiyonları içeriyor."
@@ -1370,10 +1368,32 @@ apply_file() {
     mv -f -- "$tmp2" "$filter"
   fi
 
+  # Önceki yönetilen INI bloğunu (işaretli) kaldır.
+  tmp2="$(mktemp)" || { echo "HATA: geçici dosya oluşturulamadı: $ini" >&2; rm -f -- "$filter"; return 1; }
+  sed "/^$(printf '%s' "$INI_BLOCK_BEGIN" | sed 's/[][\\/.*^$]/\\&/g')/,/^$(printf '%s' "$INI_BLOCK_END" | sed 's/[][\\/.*^$]/\\&/g')/d" "$filter" > "$tmp2" || true
+  mv -f -- "$tmp2" "$filter"
+
+  # Eski sürümlerin işaretsiz bıraktığı betik yorum satırlarını temizle.
+  # Desenler yalnızca bu betiğin ürettiği satırlarla eşleşir.
+  for _orphan in \
+    '^[[:space:]]*;[[:space:]]*disable-session-upload-progress\.sh v[0-9]+\.[0-9]+' \
+    '^[[:space:]]*;[[:space:]]*Bu blok betik tarafindan yonetilir\.' \
+    '^[[:space:]]*;[[:space:]]*Tekrar --apply calistirmak guvenlidir' \
+    '^[[:space:]]*;[[:space:]]+/.*\.bak\.session-upload-progress-[0-9]{8}-[0-9]{6}[[:space:]]*$'; do
+    tmp2="$(mktemp)" || { echo "HATA: geçici dosya oluşturulamadı: $ini" >&2; rm -f -- "$filter"; return 1; }
+    grep -v -E "$_orphan" "$filter" > "$tmp2" || true
+    mv -f -- "$tmp2" "$filter"
+  done
+
   tmp="$(mktemp "${ini}.tmp.XXXXXX")" || { echo "HATA: geçici dosya oluşturulamadı: $ini" >&2; rm -f -- "$filter"; return 1; }
+  _php_line="$(grep -n -i -m1 -E '^[[:space:]]*\[PHP\][[:space:]]*([;#].*)?$' "$filter" | cut -d: -f1 || true)"
   {
-    printf '; ------------------------------------------------------------------\n'
-    printf '; %s v%s -- profil: %s -- %s\n' "$SCRIPT_NAME" "$VERSION" "$PROFILE" "$(date '+%F %T %z')"
+    if [[ -n "$_php_line" ]]; then
+      head -n "$_php_line" -- "$filter"
+    else
+      printf '[PHP]\n'
+    fi
+    printf '%s v%s -- profil: %s -- %s\n' "$INI_BLOCK_BEGIN" "$VERSION" "$PROFILE" "$(date '+%F %T %z')"
     printf '; Bu blok betik tarafindan yonetilir. Onceki icerik su dosyaya yedeklendi:\n'
     printf ';   %s\n' "$backup"
     printf '; Tekrar --apply calistirmak guvenlidir (idempotent).\n'
@@ -1405,8 +1425,13 @@ apply_file() {
       merged="$(merged_disable_csv "$ini")"
       printf 'disable_functions = %s\n' "$merged"
     fi
+    printf '%s\n' "$INI_BLOCK_END"
     printf '\n'
-    cat -- "$filter"
+    if [[ -n "$_php_line" ]]; then
+      tail -n "+$((_php_line+1))" -- "$filter"
+    else
+      cat -- "$filter"
+    fi
   } > "$tmp"
   rm -f -- "$filter"
 

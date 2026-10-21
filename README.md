@@ -33,8 +33,10 @@ yaygın hosting panellerini ve PHP kurulumlarını otomatik tespit eder.
 1. Sunucudaki paneli tespit eder (cPanel/WHM, DirectAdmin, Plesk veya genel Linux).
 2. Tüm PHP CLI binary'lerini ve bunların kullandığı `php.ini` dosyalarını bulur;
    CLI sunmayan kurulumlar için bilinen `php.ini` yollarını da tarar.
-3. Seçilen profile göre yönetilen direktifleri **dosyanın en üstüne, global kapsama**
-   tekil satırlar olarak yazar; aynı direktifin yinelenen aktif satırlarını temizler.
+3. Seçilen profile göre yönetilen direktifleri **[PHP] başlığının hemen altında**
+   işaretli bir blok (`; BEGIN php-ini-hardening` … `; END php-ini-hardening`)
+   olarak yazar; dosyada `[PHP]` başlığı yoksa başlıkla birlikte en üste ekler.
+   Aynı direktifin yinelenen aktif satırlarını temizler.
 4. `disable_functions` değerini **mevcut değerle birleştirir** — panelin varsayılan
    kapalı listesi silinmez, üzerine profil listesi eklenir.
 5. Her değişen dosyanın zaman damgalı yedeğini alır
@@ -270,7 +272,7 @@ sudo bash disable-session-upload-progress.sh --apply --profile minimal
 
 ```text
 Panel tespiti: cPanel/WHM
-Betik: disable-session-upload-progress.sh v2.1.0 | Mod: dry-run | Profil: standard | CVE-2026-109618/109619 azaltma: kapalı
+Betik: disable-session-upload-progress.sh v2.2.0 | Mod: dry-run | Profil: standard | CVE-2026-109618/109619 azaltma: kapalı
 
 Bulunan PHP CLI sürümleri:
   PHP 8.1.27     binary=/opt/cpanel/ea-php81/root/usr/bin/php
@@ -403,8 +405,22 @@ aynen korunur, yeni yedek yalnızca içerik değişirse anlamlıdır (yedek her
 
 | Dosya | Açıklama |
 |---|---|
-| `disable-session-upload-progress.sh` | Ana betik (v2.1). |
+| `disable-session-upload-progress.sh` | Ana betik (v2.2). |
+| `tests/smoke.sh` | Bakımı yapılan duman testi (sahte ini/havuz dosyalarıyla; root/PHP gerektirmez). |
 | `README.md` | Bu belge. |
+
+## Testler
+
+Değişiklikten sonra duman testini çalıştırın (geçici dizinde sahte dosyalar
+kullanır, sisteme dokunmaz):
+
+```bash
+bash tests/smoke.sh
+```
+
+Test; sözdizimi, dry-run güvenliği, `[PHP]` yerleşimi, CVE katmanı, havuz
+zorlaması, idempotency, dosya/havuz doğrulaması ve birebir geri yüklemeyi
+kontrol eder. Sunucuda gerçek doğrulama için `--check` kullanın.
 
 Katkı ve hata bildirimi için lütfen GitHub üzerinden issue/PR açın; PR'lerinizde
 hangi panel ve PHP sürümlerinde test ettiğinizi belirtin.
