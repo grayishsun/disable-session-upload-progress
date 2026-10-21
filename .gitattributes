@@ -1,0 +1,2 @@
+# Shell betikleri her platformda LF satir sonu kullanir (Linux uyumlulugu).
+*.sh text eol=lf
