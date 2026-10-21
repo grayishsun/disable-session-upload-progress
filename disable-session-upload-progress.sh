@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Disable PHP session upload progress in known global PHP ini files.
-# Default mode is dry-run. Use --apply to write changes.
+# Default mode is dry-run. Use --apply to write changes or --check to verify only.
 set -Eeuo pipefail
 shopt -s nullglob
 
@@ -9,16 +9,19 @@ case "${1:-}" in
   "") ;;
   --apply) MODE="apply" ;;
   --dry-run) MODE="dry-run" ;;
+  --check) MODE="check" ;;
   -h|--help)
     cat <<'USAGE'
-Usage: bash disable-session-upload-progress.sh [--dry-run|--apply]
+Usage: bash disable-session-upload-progress.sh [--dry-run|--apply|--check]
 
-  --dry-run  List detected panels, PHP binaries and candidate ini files (default).
-  --apply    Back up and modify discovered global php.ini files, then verify
-             file contents and each discovered PHP CLI value using `php -i`.
+  --dry-run  List detected panels, PHP CLI binaries and candidate INI files (default).
+  --apply    Back up and modify discovered global INI files, then verify file and PHP CLI settings.
+  --check    Do not modify files; verify that each discovered INI file explicitly sets
+             session.upload_progress.enabled = Off and each discovered PHP CLI reports Off.
 
-Run as root. Each changed file gets a timestamped .bak.session-upload-progress-* backup.
-The script does not restart PHP-FPM, Apache, LiteSpeed or other services.
+Run as root. Changed files get a timestamped .bak.session-upload-progress-* backup.
+The script does not restart/reload PHP-FPM, Apache, LiteSpeed or other services.
+NOTE: CLI verification does not prove the effective setting for PHP-FPM/LiteSpeed web requests.
 USAGE
     exit 0
     ;;
@@ -67,7 +70,24 @@ is_off_value() {
   [[ "$value" == 'off' || "$value" == '0' || "$value" == 'false' || "$value" == 'no' ]]
 }
 
-# Verify the setting in the actual contents of each modified INI file.
+# Return success only if this executable is a real PHP CLI binary.
+# Some systems expose php-cgi as /usr/bin/php; running `-i` there may print
+# the php-cgi usage help instead of PHP configuration information.
+is_php_cli() {
+  local bin="$1" sapi rc
+  local tempout
+  tempout="$(mktemp)" || return 1
+  if "$bin" -r 'echo PHP_SAPI;' >"$tempout" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  sapi="$(cat "$tempout" 2>/dev/null || true)"
+  rm -f -- "$tempout"
+  [[ $rc -eq 0 && "$sapi" == 'cli' ]]
+}
+
+# Verify the setting in the actual contents of each discovered INI file.
 verify_ini_file() {
   local ini="$1" line value count
   local -a active_lines=()
@@ -90,47 +110,67 @@ verify_ini_file() {
   return 1
 }
 
-# Verify each discovered PHP CLI's effective value using the same equivalent
-# of: /path/to/php -i | grep session.upload_progress.enabled
+# Verify each discovered PHP CLI's effective value using php -i.
 verify_php_cli_settings() {
   local bin output line local_value master_value version loaded_ini
   local current_failed=0
+  local checked=0
 
   if ((${#PHP_BINS[@]} == 0)); then
-    print_warn 'PHP CLI binary bulunamadı; php -i doğrulaması yapılamadı.'
+    print_fail 'Doğrulama için kullanılabilir gerçek PHP CLI binary bulunamadı; php -i ile etkin değer doğrulanamadı.'
     return 1
   fi
 
   printf '\nPHP CLI etkin ayar doğrulaması (php -i):\n'
   for bin in "${PHP_BINS[@]}"; do
-    version="$("$bin" -r 'echo PHP_VERSION;' 2>/dev/null || printf 'bilinmiyor')"
-    loaded_ini="$("$bin" -r 'echo php_ini_loaded_file() ?: "(php.ini yüklenmemiş)";' 2>/dev/null || printf 'belirlenemedi')"
-    output="$("$bin" -i 2>&1 || true)"
+    # Extra validation avoids accidentally printing php-cgi Usage text as a version.
+    if ! is_php_cli "$bin"; then
+      print_warn "$bin: PHP CLI olarak doğrulanamadığı için atlanıyor."
+      continue
+    fi
+
+    version="$("$bin" -r 'echo PHP_VERSION;' 2>/dev/null || true)"
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+      print_fail "$bin: PHP sürümü güvenilir biçimde alınamadı; binary atlanıyor."
+      current_failed=1
+      continue
+    fi
+    loaded_ini="$("$bin" -r 'echo php_ini_loaded_file() ?: "(php.ini yüklenmemiş)";' 2>/dev/null || true)"
+    output="$("$bin" -i 2>&1)" || {
+      print_fail "$bin (PHP $version): php -i komutu başarısız oldu."
+      current_failed=1
+      continue
+    }
     line="$(printf '%s\n' "$output" | grep -m1 -E '^[[:space:]]*session[.]upload_progress[.]enabled[[:space:]]*=>' || true)"
 
     if [[ -z "$line" ]]; then
-      print_fail "$bin (PHP $version): php -i çıktısında session.upload_progress.enabled bulunamadı. php.ini=$loaded_ini"
+      print_fail "$bin (PHP $version): php -i çıktısında session.upload_progress.enabled bulunamadı. php.ini=${loaded_ini:-belirlenemedi}"
       current_failed=1
       continue
     fi
 
-    # PHP -i normally prints: directive => Local Value => Master Value.
+    # PHP -i usually reports: directive => Local Value => Master Value.
     local_value="${line#*=>}"
     local_value="${local_value%%=>*}"
     local_value="$(printf '%s' "$local_value" | sed -E 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     master_value="${line##*=>}"
     master_value="$(printf '%s' "$master_value" | sed -E 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    checked=$((checked+1))
 
     if is_off_value "$local_value" && is_off_value "$master_value"; then
       print_ok "$bin (PHP $version): session.upload_progress.enabled => $local_value => $master_value"
-      printf '     php.ini: %s\n' "$loaded_ini"
+      printf '     php.ini: %s\n' "${loaded_ini:-belirlenemedi}"
     else
       print_fail "$bin (PHP $version): etkin değer '$local_value', master değer '$master_value' (Off => Off bekleniyordu)."
-      printf '      php.ini: %s\n' "$loaded_ini"
+      printf '      php.ini: %s\n' "${loaded_ini:-belirlenemedi}"
       current_failed=1
     fi
   done
 
+  if (( checked == 0 )); then
+    print_fail 'Hiçbir PHP CLI binary etkin ayar doğrulamasına ulaşamadı.'
+    return 1
+  fi
   return "$current_failed"
 }
 
@@ -139,6 +179,13 @@ add_bin() {
   [[ -x "$p" && ! -d "$p" ]] || return 0
   [[ -n "${seen_bins[$p]+x}" ]] && return 0
   seen_bins[$p]=1
+
+  if ! is_php_cli "$p"; then
+    if [[ "$p" == '/usr/bin/php' || "$p" == '/usr/local/bin/php' ]]; then
+      print_warn "$p PHP CLI değil veya -r desteklemiyor (muhtemelen php-cgi); php -i doğrulamasına alınmadı."
+    fi
+    return 0
+  fi
   PHP_BINS+=("$p")
 }
 
@@ -170,13 +217,12 @@ if ((${#PHP_BINS[@]} == 0)); then
   echo '  PHP CLI binary bulunamadı; bilinen yapılandırma yolları taranacak.'
 else
   for bin in "${PHP_BINS[@]}"; do
-    version="$("$bin" -r 'echo PHP_VERSION;' 2>/dev/null || true)"
-    ini="$("$bin" -r 'echo php_ini_loaded_file() ?: "(php.ini yüklenmemiş)";' 2>/dev/null || true)"
+    version="$("$bin" -r 'echo PHP_VERSION;' 2>/dev/null || printf 'bilinmiyor')"
+    ini="$("$bin" -r 'echo php_ini_loaded_file() ?: "(php.ini yüklenmemiş)";' 2>/dev/null || printf 'belirlenemedi')"
     printf '  PHP %-10s binary=%s\n    ini=%s\n' "${version:-bilinmiyor}" "$bin" "${ini:-belirlenemedi}"
-    [[ -n "$ini" && "$ini" != '(php.ini yüklenmemiş)' ]] && add_ini "$ini"
+    [[ -n "$ini" && "$ini" != '(php.ini yüklenmemiş)' && "$ini" != 'belirlenemedi' ]] && add_ini "$ini"
 
-    # If a scanned .ini file explicitly sets this directive, include it too,
-    # because it can override the value in the main php.ini.
+    # Include scanned .ini files only if they explicitly set this directive.
     scanned="$("$bin" -r 'echo php_ini_scanned_files() ?: "";' 2>/dev/null || true)"
     if [[ -n "$scanned" ]]; then
       while IFS= read -r scanfile; do
@@ -207,8 +253,8 @@ done
 
 printf '\nBulunan PHP yapılandırma dosyaları (%d):\n' "${#INI_FILES[@]}"
 if ((${#INI_FILES[@]} == 0)); then
-  echo '  php.ini bulunamadı. Hiçbir dosya değiştirilmedi.'
-  exit 0
+  print_fail 'php.ini bulunamadı. Hiçbir dosya değiştirilmedi.'
+  exit 1
 fi
 for ini in "${INI_FILES[@]}"; do
   if grep -Eq '^[[:space:]]*session[.]upload_progress[.]enabled[[:space:]]*=[[:space:]]*(Off|off|0|false|no)[[:space:]]*([;#].*)?$' "$ini"; then
@@ -227,7 +273,24 @@ if [[ "$MODE" == 'dry-run' ]]; then
 DRY-RUN: Hiçbir dosya değiştirilmedi.
 Uygulamak için:
   bash disable-session-upload-progress.sh --apply
+Yalnızca doğrulama yapmak için:
+  bash disable-session-upload-progress.sh --check
 NOTE
+  exit 0
+fi
+
+if [[ "$MODE" == 'check' ]]; then
+  printf '\nCHECK: Hiçbir dosya değiştirilmeyecek; mevcut durum doğrulanıyor.\n'
+  verification_failed=0
+  for ini in "${INI_FILES[@]}"; do
+    verify_ini_file "$ini" || verification_failed=1
+  done
+  verify_php_cli_settings || verification_failed=1
+  if (( verification_failed > 0 )); then
+    printf '\nCHECK SONUCU: BAŞARISIZ — yukarıdaki [FAIL] satırlarını inceleyin.\n'
+    exit 1
+  fi
+  printf '\nCHECK SONUCU: BAŞARILI — bulunan INI dosyaları ve PHP CLI ayarları Off olarak doğrulandı.\n'
   exit 0
 fi
 
@@ -245,8 +308,7 @@ for ini in "${INI_FILES[@]}"; do
     continue
   fi
 
-  # Put one canonical boolean before any INI section header and remove all
-  # active duplicates from the file, avoiding ambiguous duplicate directives.
+  # Put one canonical boolean before any INI section header and remove all active duplicates.
   if ! awk '
     BEGIN { print "session.upload_progress.enabled = Off"; print "" }
     /^[[:space:]]*session[.]upload_progress[.]enabled[[:space:]]*=/ { next }
@@ -258,7 +320,7 @@ for ini in "${INI_FILES[@]}"; do
     continue
   fi
 
-  # Preserve basic permissions/ownership and, where supported, ACL/xattr metadata.
+  # Preserve permissions/ownership and supported ACL/xattr metadata where possible.
   cp --attributes-only --preserve=all -- "$ini" "$tmp" 2>/dev/null || {
     chown --reference="$ini" "$tmp" 2>/dev/null || true
     chmod --reference="$ini" "$tmp" 2>/dev/null || true
@@ -291,7 +353,7 @@ cat <<'NOTE'
 - Script servisleri yeniden başlatmaz/reload etmez.
 - PHP-FPM kullanan sistemlerde değişikliğin web isteklerine uygulanması için ilgili PHP-FPM servislerinin kontrollü reload/restart edilmesi gerekebilir.
 - Bu ayar PHP_INI_PERDIR kapsamındadır. .user.ini, vhost veya PHP-FPM pool ayarları değeri tekrar açabilir; web tarafında ayrıca doğrulayın.
-- PHP -i doğrulaması yalnızca bulunan CLI binary'lerini kontrol eder; PHP-FPM/LiteSpeed web handler'ının etkin yapılandırmasını kesin olarak doğrulamaz.
+- PHP -i doğrulaması yalnızca bulunan gerçek PHP CLI binary'lerini kontrol eder; PHP-FPM/LiteSpeed web handler'ının etkin yapılandırmasını kesin olarak doğrulamaz.
 - Bu, CVE-2026-109618/109619 için geçici bir azaltımdır; PHP/vendor güvenlik yamalarının yerine geçmez.
 NOTE
 
